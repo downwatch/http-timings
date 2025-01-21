@@ -4,77 +4,143 @@
 #![deny(clippy::all)]
 #![deny(clippy::pedantic)]
 #![deny(clippy::cargo)]
+#![deny(clippy::unwrap_used)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::cast_possible_wrap)]
 
-//! # http-timings
+//! Obtain the HTTP timings for any given URL
 //!
-//! `http-timings` is a simple library to measure the key HTTP timings
-//! from the [dev-tools](https://developer.chrome.com/docs/devtools/network/reference/?utm_source=devtools#timing-explanation)
+//! This crate provides a way to measure the HTTP timings for any given URL.
+//! This crate also provides basic and the certificate information for the given URL.
 //!
-//! ## Usage
-//! ```
-//! use http_timings::request_url;
+//! Example:
+//! ```rust
+//! use http_timings::from_string;
+//! use std::time::Duration;
 //!
-//! if let Ok(timings) = request_url("https://www.google.com") {
-//!    println!("{:?}", timings); // Outputs a [`RequestOutput`] struct
+//! let url = "https://www.example.com";
+//! let timeout = Some(Duration::from_secs(5)); // Set a timeout of 5 seconds
+//! match from_string(url, timeout) {
+//!     Ok(response) => {
+//!         println!("Response Status: {}", response.status);
+//!         println!("Response Body: {}", response.body);
+//!         if let Some(cert_info) = response.certificate_information {
+//!             println!("Certificate Subject: {:?}", cert_info.subject);
+//!             println!("Certificate Issued At: {:?}", cert_info.issued_at);
+//!             println!("Certificate Expires At: {:?}", cert_info.expires_at);
+//!             println!("Is Certificate Active: {:?}", cert_info.is_active);
+//!         } else {
+//!             println!("No certificate information available.");
+//!         }
+//!     },
+//!     Err(e) => {
+//!         eprintln!("Error occurred: {:?}", e);
+//!     }
 //! }
 //! ```
 
 use std::{
-    error::Error,
     fmt::Debug,
     io::{BufRead, BufReader, Read, Write},
-    net::{TcpStream, ToSocketAddrs},
-    time::Duration,
+    net::{SocketAddr, TcpStream, ToSocketAddrs},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+    vec::IntoIter,
 };
 
 use flate2::read::{DeflateDecoder, GzDecoder};
-use rustls_connector::RustlsConnector;
+use openssl::{
+    asn1::{Asn1Time, Asn1TimeRef},
+    error::ErrorStack,
+    ssl::{SslConnector, SslMethod, SslVerifyMode},
+    x509::X509,
+};
 use url::Url;
 
-trait ReadWrite: Read + Write + Debug {}
-impl<T: Read + Write + Send + Sync + Debug> ReadWrite for T {}
+extern crate openssl;
 
-/// A pair of durations
+/// `ReadWrite` trait
 ///
-/// The `total` field is the sum of the durations up to that step
-/// The `relative` field is the duration of the step itself
+/// This trait is implemented for types that implement the `Read` and `Write` traits.
+/// This is mainly used to make socket streams compatible with both [`TcpStream`] and [`openssl::ssl::SslStream`].
+pub trait ReadWrite: Read + Write + Debug {}
+impl<T: Read + Write + Debug> ReadWrite for T {}
+
+/// Error types
+///
+/// This module contains the error types for the http-timings crate.
+///
+/// The errors are defined using the `thiserror` crate.
+pub mod error {
+    use thiserror::Error;
+
+    use crate::ReadWrite;
+
+    #[derive(Error, Debug)]
+    /// Error types
+    ///
+    /// This enum contains the error types for the http-timings crate.
+    pub enum Error {
+        #[error("io error")]
+        /// IO error, derived from [`std::io::Error`]
+        Io(#[from] std::io::Error),
+        #[error("ssl error")]
+        /// SSL error, derived from [`openssl::error::ErrorStack`]
+        Ssl(#[from] openssl::error::ErrorStack),
+        #[error("ssl handshake error")]
+        /// SSL handshake error, derived from [`openssl::ssl::HandshakeError`]
+        SslHandshake(#[from] openssl::ssl::HandshakeError<Box<dyn ReadWrite + Send + Sync>>),
+        #[error("ssl certificate not found")]
+        /// SSL certificate not found
+        SslCertificateNotFound,
+        #[error("system time error")]
+        /// System time error, derived from [`std::time::SystemTimeError`]
+        SystemTime(#[from] std::time::SystemTimeError),
+    }
+}
+
 #[derive(Debug)]
+/// A pair of durations, one total and one relative
+///
+/// The total duration is the sum of the relative duration and the previous duration.
 pub struct DurationPair {
     total: Duration,
     relative: Duration,
 }
 
 impl DurationPair {
-    /// Get the total duration
+    /// Returns the total duration
     #[must_use]
     pub fn total(&self) -> Duration {
         self.total
     }
 
-    /// Get the relative duration
+    /// Returns the relative duration
     #[must_use]
     pub fn relative(&self) -> Duration {
         self.relative
     }
 }
 
-/// The key HTTP timings for a request
 #[derive(Debug)]
-pub struct RequestTimings {
-    dns: Duration,
-    tcp: Duration,
-    tls: Option<Duration>,
-    http_send: Duration,
-    ttfb: Duration,
-    content_download: Duration,
+/// The response timings for any given request. The response timings can be found
+/// [here](https://developer.chrome.com/docs/devtools/network/reference/?utm_source=devtools#timing-explanation).
+pub struct ResponseTimings {
+    /// DNS resolution time
+    pub dns: DurationPair,
+    /// TCP connection time
+    pub tcp: DurationPair,
+    /// TLS handshake time
+    pub tls: Option<DurationPair>,
+    /// HTTP request send time
+    pub http_send: DurationPair,
+    /// Time To First Byte
+    pub ttfb: DurationPair,
+    /// Content download time
+    pub content_download: DurationPair,
 }
 
-impl RequestTimings {
-    /// Create a new instance of [`RequestTimings`]
-    ///
-    /// All durations are relative, the [`DurationPair`] is called to get the total duration
-    #[must_use]
-    pub fn new(
+impl ResponseTimings {
+    fn new(
         dns: Duration,
         tcp: Duration,
         tls: Option<Duration>,
@@ -82,6 +148,39 @@ impl RequestTimings {
         ttfb: Duration,
         content_download: Duration,
     ) -> Self {
+        let dns = DurationPair {
+            total: dns,
+            relative: dns,
+        };
+
+        let tcp = DurationPair {
+            total: dns.total + tcp,
+            relative: tcp,
+        };
+
+        let tls = tls.map(|tls| DurationPair {
+            total: tcp.total + tls,
+            relative: tls,
+        });
+
+        let http_send = DurationPair {
+            total: match &tls {
+                Some(tls) => tls.total + http_send,
+                None => tcp.total + http_send,
+            },
+            relative: http_send,
+        };
+
+        let ttfb = DurationPair {
+            total: http_send.total + ttfb,
+            relative: ttfb,
+        };
+
+        let content_download = DurationPair {
+            total: ttfb.total + content_download,
+            relative: content_download,
+        };
+
         Self {
             dns,
             tcp,
@@ -91,217 +190,186 @@ impl RequestTimings {
             content_download,
         }
     }
-
-    /// Get the DNS timings
-    #[must_use]
-    pub fn dns(&self) -> DurationPair {
-        DurationPair {
-            total: self.dns,
-            relative: self.dns,
-        }
-    }
-
-    /// Get the TCP timings
-    ///
-    /// # Panics
-    /// This will panic if the total duration overflows
-    #[must_use]
-    pub fn tcp(&self) -> DurationPair {
-        DurationPair {
-            total: self.dns().total.checked_add(self.tcp).unwrap(),
-            relative: self.tcp,
-        }
-    }
-
-    /// Get the TLS timings
-    ///
-    /// # Panics
-    /// This will panic if the total duration overflows
-    #[must_use]
-    pub fn tls(&self) -> Option<DurationPair> {
-        self.tls.map(|duration| DurationPair {
-            total: self.tcp().total.checked_add(duration).unwrap(),
-            relative: duration,
-        })
-    }
-
-    /// Get the HTTP Send timings
-    ///
-    /// # Panics
-    /// This will panic if the total duration overflows
-    #[must_use]
-    pub fn http_send(&self) -> DurationPair {
-        DurationPair {
-            total: self
-                .tls()
-                .map_or_else(|| self.tcp().total, |tls| tls.total)
-                .checked_add(self.http_send)
-                .unwrap(),
-            relative: self.http_send,
-        }
-    }
-
-    /// Get the Time To First Byte timings
-    ///
-    /// # Panics
-    /// This will panic if the total duration overflows
-    #[must_use]
-    pub fn ttfb(&self) -> DurationPair {
-        DurationPair {
-            total: self.http_send.checked_add(self.ttfb).unwrap(),
-            relative: self.ttfb,
-        }
-    }
-
-    /// Get the Content Download timings
-    ///
-    /// # Panics
-    /// This will panic if the total duration overflows
-    #[must_use]
-    pub fn content_download(&self) -> DurationPair {
-        DurationPair {
-            total: self
-                .ttfb()
-                .total
-                .checked_add(self.content_download)
-                .unwrap(),
-            relative: self.content_download,
-        }
-    }
-
-    /// Get the total duration
-    #[must_use]
-    pub fn total(&self) -> Duration {
-        self.content_download().total
-    }
 }
 
-/// Output structure for a call to [`request_url`]
 #[derive(Debug)]
-pub struct RequestOutput {
-    status: u16,
-    timings: RequestTimings,
-    body: String,
+/// Basic information about an SSL certificate
+pub struct CertificateInformation {
+    /// Issued at
+    pub issued_at: SystemTime,
+    /// Expires at
+    pub expires_at: SystemTime,
+    /// Subject
+    pub subject: String,
+    /// Is active
+    pub is_active: bool,
 }
 
-impl RequestOutput {
-    /// Get the status code
-    #[must_use]
-    pub fn status(&self) -> u16 {
-        self.status
-    }
-
-    /// Get the timings
-    #[must_use]
-    pub fn timings(&self) -> &RequestTimings {
-        &self.timings
-    }
-
-    /// Get the body
-    #[must_use]
-    pub fn body(&self) -> &str {
-        &self.body
-    }
+#[derive(Debug)]
+/// The response from a given request
+pub struct Response {
+    /// The timings of the response
+    pub timings: ResponseTimings,
+    /// The certificate information
+    pub certificate_information: Option<CertificateInformation>,
+    /// The raw certificate
+    pub certificate: Option<X509>,
+    /// The status of the response
+    pub status: u16,
+    /// The body of the response
+    pub body: String,
 }
 
-fn get_dns_timing(url: &Url) -> Result<Duration, Box<dyn Error>> {
+fn asn1_time_to_system_time(time: &Asn1TimeRef) -> Result<SystemTime, ErrorStack> {
+    let unix_time = Asn1Time::from_unix(0)?.diff(time)?;
+    Ok(SystemTime::UNIX_EPOCH
+        + Duration::from_secs((unix_time.days as u64) * 86400 + unix_time.secs as u64))
+}
+
+fn get_dns_timing(url: &Url) -> Result<(Duration, IntoIter<SocketAddr>), error::Error> {
     let Some(domain) = url.host_str() else {
-        return Err(Box::new(std::io::Error::new(
+        return Err(error::Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "Invalid URL",
+            "invalid url",
         )));
     };
     let port = url.port().unwrap_or(match url.scheme() {
         "http" => 80,
         "https" => 443,
         _ => {
-            return Err(Box::new(std::io::Error::new(
+            return Err(error::Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "Invalid scheme",
+                "invalid url scheme",
             )))
         }
     });
-    let now = std::time::Instant::now();
+    let start = std::time::Instant::now();
     match format!("{domain}:{port}").to_socket_addrs() {
-        Ok(_) => {}
-        Err(e) => return Err(Box::new(e)),
-    };
-    Ok(now.elapsed())
+        Ok(addrs) => Ok((start.elapsed(), addrs)),
+        Err(e) => Err(error::Error::Io(e)),
+    }
 }
 
 fn get_tcp_timing(
-    url: &Url,
-    max_duration: Option<Duration>,
-) -> Result<(Box<dyn ReadWrite + Send + Sync>, Duration), Box<dyn Error>> {
-    // Unwrap is safe here because we know the URL is valid from the DNS timing
-    let host = url.host_str().unwrap();
+    addr: &SocketAddr,
+    timeout: Option<Duration>,
+) -> Result<(Duration, Box<dyn ReadWrite + Send + Sync>), error::Error> {
     let now = std::time::Instant::now();
-    let port = url.port().unwrap_or(match url.scheme() {
-        "http" => 80,
-        "https" => 443,
-        _ => {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Invalid URL scheme",
-            )))
-        }
-    });
-    let stream = match TcpStream::connect(format!("{host}:{port}")) {
+    let stream = match TcpStream::connect_timeout(addr, timeout.unwrap_or(Duration::from_secs(5))) {
         Ok(stream) => stream,
-        Err(e) => return Err(Box::new(e)),
+        Err(e) => return Err(error::Error::Io(e)),
     };
-    stream.set_read_timeout(max_duration)?;
-    Ok((Box::new(stream), now.elapsed()))
+    Ok((now.elapsed(), Box::new(stream)))
+}
+
+struct TlsTimingResponse {
+    timing: Duration,
+    stream: Box<dyn ReadWrite + Send + Sync>,
+    certificate_information: Option<CertificateInformation>,
+    certificate: Option<X509>,
 }
 
 fn get_tls_timing(
     url: &Url,
     stream: Box<dyn ReadWrite + Send + Sync>,
-) -> Result<(Box<dyn ReadWrite + Send + Sync>, Option<Duration>), Box<dyn Error>> {
-    let connector = RustlsConnector::new_with_webpki_roots_certs();
+) -> Result<TlsTimingResponse, error::Error> {
     let now = std::time::Instant::now();
-    let stream = match connector.connect(url.host_str().unwrap(), stream) {
-        Ok(stream) => stream,
-        Err(e) => {
-            return Err(Box::new(e));
-        }
+    let connector = {
+        let mut context = match SslConnector::builder(SslMethod::tls()) {
+            Ok(context) => context,
+            Err(e) => return Err(error::Error::Ssl(e)),
+        };
+        context.set_verify(SslVerifyMode::NONE);
+        context.build()
     };
-    Ok((Box::new(stream), Some(now.elapsed())))
+    let stream = match connector.connect(
+        match url.host_str() {
+            Some(host) => host,
+            None => {
+                return Err(error::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid url host",
+                )))
+            }
+        },
+        stream,
+    ) {
+        Ok(stream) => stream,
+        Err(e) => return Err(error::Error::SslHandshake(e)),
+    };
+    let Some(raw_certificate) = stream.ssl().peer_certificate() else {
+        return Err(error::Error::SslCertificateNotFound);
+    };
+    let time_elapsed = now.elapsed();
+
+    let current_asn1_time =
+        Asn1Time::from_unix(match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs() as i64,
+            Err(e) => return Err(error::Error::SystemTime(e)),
+        })?;
+    let certificate_information = CertificateInformation {
+        issued_at: asn1_time_to_system_time(raw_certificate.not_before())?,
+        expires_at: asn1_time_to_system_time(raw_certificate.not_after())?,
+        subject: raw_certificate
+            .subject_name()
+            .entries()
+            .map(|entry| entry.data().as_slice().to_ascii_lowercase())
+            .map(|entry| String::from_utf8_lossy(entry.as_slice()).into_owned())
+            .collect(),
+        is_active: raw_certificate.not_after() > current_asn1_time,
+    };
+
+    Ok(TlsTimingResponse {
+        timing: time_elapsed,
+        stream: Box::new(stream),
+        certificate_information: Some(certificate_information),
+        certificate: Some(raw_certificate),
+    })
 }
 
 fn get_http_send_timing(
     url: &Url,
     stream: &mut Box<dyn ReadWrite + Send + Sync>,
-) -> Result<Duration, Box<dyn Error>> {
-    let header = format!("GET {} HTTP/1.0\r\nHost: {}\r\nAccept-Encoding: gzip, deflate, br\r\nUser-Agent: http-timings/0.1\r\nConnection: keep-alive\r\nAccept: */*\r\n\r\n", url.path(), url.host().unwrap());
+) -> Result<Duration, error::Error> {
     let now = std::time::Instant::now();
-    if let Err(e) = stream.write_all(header.as_bytes()) {
-        return Err(Box::new(e));
-    };
+    let request = format!(
+        "GET {} HTTP/1.0\r\nHost: {}\r\nAccept-Encoding: gzip, deflate, br\r\nUser-Agent: http-timings/0.2\r\nConnection: keep-alive\r\nAccept: */*\r\n\r\n",
+        url.path(),
+        match url.host_str() {
+            Some(host) => host,
+            None => return Err(error::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid url host",
+            ))),
+        }
+    );
+    if let Err(err) = stream.write_all(request.as_bytes()) {
+        return Err(error::Error::Io(err));
+    }
     Ok(now.elapsed())
 }
 
 fn get_ttfb_timing(
     stream: &mut Box<dyn ReadWrite + Send + Sync>,
-) -> Result<Duration, Box<dyn Error>> {
-    let mut one_byte_buf = [0_u8];
+) -> Result<Duration, error::Error> {
+    let mut one_byte = vec![0_u8];
     let now = std::time::Instant::now();
-    if let Err(e) = stream.read_exact(&mut one_byte_buf) {
-        return Err(Box::new(e));
-    };
+    if let Err(err) = stream.read_exact(&mut one_byte) {
+        return Err(error::Error::Io(err));
+    }
     Ok(now.elapsed())
 }
 
 fn get_content_download_timing(
     stream: &mut Box<dyn ReadWrite + Send + Sync>,
-) -> Result<(u16, Duration, String), Box<dyn Error>> {
+) -> Result<(Duration, u16, String), error::Error> {
     let mut reader = BufReader::new(stream);
     let mut header_buf = String::new();
     let now = std::time::Instant::now();
     loop {
         let bytes_read = match reader.read_line(&mut header_buf) {
             Ok(bytes_read) => bytes_read,
-            Err(e) => return Err(Box::new(e)),
+            Err(err) => return Err(error::Error::Io(err)),
         };
         if bytes_read == 2 {
             break;
@@ -327,33 +395,29 @@ fn get_content_download_timing(
         .collect::<Vec<_>>()
         .first()
     {
-        Some(status) => status.split(' ').collect::<Vec<_>>()[1].parse::<u16>()?,
+        Some(status) => status.split(' ').collect::<Vec<_>>()[1]
+            .parse::<u16>()
+            .unwrap_or(0),
         None => {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "No status code returned",
+            return Err(error::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid http status",
             )))
         }
     };
 
-    if content_length == 0 {
-        return Ok((status, now.elapsed(), String::new()));
-    }
-
     let mut body_buf;
     if content_length == 0 {
         body_buf = vec![];
-        if let Err(e) = reader.read_to_end(&mut body_buf) {
-            return Err(Box::new(e));
+        if let Err(err) = reader.read_to_end(&mut body_buf) {
+            return Err(error::Error::Io(err));
         }
     } else {
         body_buf = vec![0_u8; content_length];
-        if let Err(e) = reader.read_exact(&mut body_buf) {
-            return Err(Box::new(e));
-        };
+        if let Err(err) = reader.read_exact(&mut body_buf) {
+            return Err(error::Error::Io(err));
+        }
     }
-
-    let content_download_time = now.elapsed();
 
     let content_encoding = match headers
         .filter(|line| line.to_ascii_lowercase().starts_with("content-encoding"))
@@ -375,124 +439,130 @@ fn get_content_download_timing(
         "deflate" => {
             let mut decoder = DeflateDecoder::new(&body_buf[..]);
             let mut string = String::new();
-            if let Err(e) = decoder.read_to_string(&mut string) {
-                return Err(Box::new(e));
+            if let Err(err) = decoder.read_to_string(&mut string) {
+                return Err(error::Error::Io(err));
             }
             string
         }
         "br" => {
             let mut decoder = brotli::Decompressor::new(&body_buf[..], 4096);
             let mut buf = vec![];
-            if let Err(e) = decoder.read_to_end(&mut buf) {
-                return Err(Box::new(e));
+            if let Err(err) = decoder.read_to_end(&mut buf) {
+                return Err(error::Error::Io(err));
             }
             String::from_utf8_lossy(&buf).into_owned()
         }
         _ => String::from_utf8_lossy(&body_buf).into_owned(),
     };
-    Ok((status, content_download_time, body))
+
+    Ok((now.elapsed(), status, body))
 }
 
-fn get_request_output(
-    url_input: impl AsRef<str>,
-    max_duration: Option<Duration>,
-) -> Result<RequestOutput, Box<dyn Error>> {
-    let input = url_input.as_ref();
-    if input.is_empty() {
-        return Err(Box::new(std::io::Error::new(
+/// Measures the HTTP timings from the given URL
+///
+/// # Errors
+///
+/// This function will return an error if the URL is invalid or the URL is not reachable.
+/// It could also error under any scenario in the [`error::Error`] enum.
+pub fn from_url(url: &Url, timeout: Option<Duration>) -> Result<Response, error::Error> {
+    let (dns_timing, mut socket_addrs) = get_dns_timing(url)?;
+    let Some(url_ip) = socket_addrs.next() else {
+        return Err(error::Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "Missing URL input",
+            "invalid url ip",
         )));
+    };
+    let (tcp_timing, mut stream) = get_tcp_timing(&url_ip, timeout)?;
+    let mut ssl_certificate = None;
+    let mut ssl_certificate_information = None;
+    let mut tls_timing = None;
+    if url.scheme() == "https" {
+        let timing_response = get_tls_timing(url, stream)?;
+        tls_timing = Some(timing_response.timing);
+        ssl_certificate = timing_response.certificate;
+        ssl_certificate_information = timing_response.certificate_information;
+        stream = timing_response.stream;
     }
-    let input = input.to_string();
-    let input = if input.starts_with("http") {
-        input
-    } else {
-        format!("http://{input}")
-    };
+    let http_send_timing = get_http_send_timing(url, &mut stream)?;
+    let ttfb_timing = get_ttfb_timing(&mut stream)?;
+    let (content_download_timing, status, body) = get_content_download_timing(&mut stream)?;
 
-    let url = match Url::parse(input.as_str()) {
-        Ok(url) => url,
-        Err(e) => return Err(Box::new(e)),
-    };
-
-    let dns = get_dns_timing(&url)?;
-    let (stream, tcp) = get_tcp_timing(&url, max_duration)?;
-    let (mut stream, tls) = if url.scheme() == "https" {
-        get_tls_timing(&url, stream)?
-    } else {
-        (stream, None)
-    };
-    let http_send = get_http_send_timing(&url, &mut stream)?;
-    let ttfb = get_ttfb_timing(&mut stream)?;
-    let (status, content_download, body) = get_content_download_timing(&mut stream)?;
-
-    Ok(RequestOutput {
+    Ok(Response {
+        timings: ResponseTimings::new(
+            dns_timing,
+            tcp_timing,
+            tls_timing,
+            http_send_timing,
+            ttfb_timing,
+            content_download_timing,
+        ),
+        certificate_information: ssl_certificate_information,
+        certificate: ssl_certificate,
         status,
-        timings: RequestTimings::new(dns, tcp, tls, http_send, ttfb, content_download),
         body,
     })
 }
 
-/// Get the HTTP timings, status and body for a given URL
+/// Given a string, it will be parsed as a URL and the HTTP timings will be measured
 ///
 /// # Errors
-/// This will error if:
-/// - The URL is invalid
-/// - Any timing step fails
-/// - Decoding the body fails
-pub fn request_url(url_input: impl AsRef<str>) -> Result<RequestOutput, Box<dyn Error>> {
-    get_request_output(url_input, None)
-}
+///
+/// This function will return an error if the URL is invalid or the URL is not reachable.
+/// It could also error under any scenario in the [`error::Error`] enum.
+pub fn from_string(url: &str, timeout: Option<Duration>) -> Result<Response, error::Error> {
+    let input = if !url.starts_with("http://") && !url.starts_with("https://") {
+        format!("http://{url}")
+    } else {
+        url.to_string()
+    };
 
-/// Get the HTTP timings, status and body for a given URL with a timeout
-///
-/// # Errors
-/// This will error if:
-/// - The URL is invalid
-/// - Any timing step fails
-/// - Decoding the body fails
-pub fn request_url_with_timeout(
-    url_input: impl AsRef<str>,
-    max_duration: Duration,
-) -> Result<RequestOutput, Box<dyn Error>> {
-    get_request_output(url_input, Some(max_duration))
+    let url = Url::parse(&input).map_err(|e| {
+        error::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid url: {e}"),
+        ))
+    })?;
+    from_url(&url, timeout)
 }
 
 #[cfg(test)]
-mod test {
-    use std::time::Duration;
+mod tests {
+    use super::*;
     const TIMEOUT: Duration = Duration::from_secs(5);
-
-    use crate::request_url_with_timeout;
 
     #[test]
     fn test_non_tls_connection() {
         let url = "neverssl.com";
-        let output = request_url_with_timeout(url, TIMEOUT).unwrap();
-        assert_eq!(output.status(), 200);
-        assert!(output.body().contains("Follow @neverssl"));
-        assert!(output.timings().dns().total().as_secs() < 1);
-        assert!(output.timings().content_download().total().as_secs() < 5);
+        let result = from_string(url, Some(TIMEOUT));
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("Follow @neverssl"));
+        assert!(response.timings.dns.total.as_secs() < 1);
+        assert!(response.timings.content_download.total.as_secs() < 5);
     }
 
     #[test]
     fn test_popular_tls_connection() {
         let url = "https://www.google.com";
-        let output = request_url_with_timeout(url, TIMEOUT).unwrap();
-        assert_eq!(output.status(), 200);
-        assert!(output.body().contains("Google Search"));
-        assert!(output.timings().dns().total().as_secs() < 1);
-        assert!(output.timings().content_download().total().as_secs() < 5);
+        let result = from_string(url, Some(TIMEOUT));
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("Google Search"));
+        assert!(response.timings.dns.total.as_secs() < 1);
+        assert!(response.timings.content_download.total.as_secs() < 5);
     }
 
     #[test]
     fn test_ip() {
         let url = "1.1.1.1";
-        let output = request_url_with_timeout(url, TIMEOUT).unwrap();
-        assert_eq!(output.status(), 301);
-        assert!(!output.body().is_empty());
-        assert!(output.timings().dns().total().as_secs() < 1);
-        assert!(output.timings().content_download().total().as_secs() < 5);
+        let result = from_string(url, Some(TIMEOUT));
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.status, 301);
+        assert!(!response.body.is_empty());
+        assert!(response.timings.dns.total.as_secs() < 1);
+        assert!(response.timings.content_download.total.as_secs() < 5);
     }
 }

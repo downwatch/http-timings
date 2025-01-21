@@ -1,23 +1,21 @@
 [package]
 name = "http-timings"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
 description = "A simple library to measure the key HTTP timings from the development tools"
 license-file = "LICENSE"
-repository = "https://github.com/down-watch/http-timings"
+repository = "https://github.com/downwatch/http-timings"
 readme = "README.md"
 keywords = ["ttfb", "http", "timings", "web", "performance"]
 categories = ["development-tools", "web-programming"]
 documentation = "https://docs.rs/http-timings"
 authors = [
-    "Fabio Almeida <me@fabioalmeida.dev>"
+    "Fabio Almeida <fabio@down.watch>"
 ]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-url = "2.5.2"
-rustls = "0.23.15"
-rustls-connector = { version = "0.21.4", features = ["webpki-roots-certs"] }
-brotli = "7.0.0"
-flate2 = "1.0.34"
+url = { version = "2.5" }
+openssl = { version = "0.10" }
+brotli = { version = "7.0" }
+flate2 = { version = "1.0" }
+thiserror = { version = "2.0" }
